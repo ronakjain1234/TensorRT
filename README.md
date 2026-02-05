@@ -228,6 +228,129 @@ For Linux platforms, we recommend that you generate a docker container for build
   - `GPU_ARCHS`: GPU (SM) architectures to target. By default we generate CUDA code for all major SMs. Specific SM versions can be specified here as a quoted space-separated list to reduce compilation time and binary size. Table of compute capabilities of NVIDIA GPUs can be found [here](https://developer.nvidia.com/cuda-gpus). Examples: - NVidia A100: `-DGPU_ARCHS="80"` - RTX 50 series: `-DGPU_ARCHS="120"` - Multiple SMs: `-DGPU_ARCHS="80 120"`
   - `TRT_PLATFORM_ID`: Bare-metal build (unlike containerized cross-compilation). Currently supported options: `x86_64` (default).
 
+# Optimization Techniques
+
+TensorRT provides a comprehensive set of optimizations for inference. This section summarizes the key techniques and where to find them in the codebase.
+
+## Optimization Categories
+
+| Category | Techniques | Key Locations |
+|----------|------------|---------------|
+| **Model-Level** | Layer fusion, constant folding, precision modes (FP16/BF16/INT8/FP8/FP4) | `plugin/*/`, `tools/onnx-graphsurgeon/` |
+| **Kernel-Level** | Custom plugins (attention, normalization, NMS), Tensor Core utilization | `plugin/bertQKVToContextPlugin/`, `plugin/skipLayerNormPlugin/`, `plugin/efficientNMSPlugin/` |
+| **Memory** | Weight stripping, low VRAM mode, memory pooling | `samples/python/sample_weight_stripping/`, `demo/Diffusion/` |
+| **Runtime** | CUDA graphs, timing cache, optimization profiles | `demo/BERT/infer_c/`, `samples/sampleEditableTimingCache/` |
+| **Quantization** | PTQ, QAT, calibration methods | `tools/pytorch-quantization/`, `tools/tensorflow-quantization/`, `samples/sampleINT8API/` |
+| **Sparsity** | 2:4 structured sparsity, sparse + quantization | `demo/BERT/builder_varseqlen.py` |
+
+## Top 10 Optimization Techniques
+
+### 1. FP16/BF16 Mixed Precision
+**Impact:** ~2x speedup with minimal accuracy loss
+
+| Location | File |
+|----------|------|
+| trtexec | `samples/trtexec/trtexec.cpp` |
+| Diffusion | `demo/Diffusion/demo_txt2img_xl.py` |
+
+### 2. INT8 Quantization
+**Impact:** ~2-4x speedup over FP16, significant memory reduction
+
+| Location | File |
+|----------|------|
+| C++ sample | `samples/sampleINT8API/sampleINT8API.cpp` |
+| Calibrator | `samples/common/EntropyCalibrator.h` |
+| BERT | `demo/BERT/builder.py` |
+| PyTorch QAT | `tools/pytorch-quantization/pytorch_quantization/nn/modules/quant_conv.py` |
+
+### 3. FP8 Quantization (Hopper/Ada/Blackwell)
+**Impact:** Best speed/accuracy tradeoff on modern GPUs
+
+| Location | File |
+|----------|------|
+| Flux FP8 | `demo/Diffusion/demo_txt2img_flux.py` |
+| ModelOpt utils | `demo/Diffusion/demo_diffusion/utils_modelopt.py` |
+
+### 4. Layer Fusion (Fused Attention)
+**Impact:** Dramatic reduction in memory bandwidth and kernel launches
+
+| Location | File |
+|----------|------|
+| Fused MHA | `plugin/bertQKVToContextPlugin/` |
+| Skip + LayerNorm | `plugin/skipLayerNormPlugin/skipLayerNormPlugin.cpp` |
+| Embedding + LayerNorm | `plugin/embLayerNormPlugin/embLayerNormPlugin.cpp` |
+
+### 5. CUDA Graphs
+**Impact:** ~10-30% latency reduction by eliminating CPU overhead
+
+| Location | File |
+|----------|------|
+| BERT | `demo/BERT/infer_c/infer_c.cpp` |
+| Diffusion | Use `--use-cuda-graph` flag in `demo/Diffusion/` |
+
+### 6. Dynamic Shapes with Optimization Profiles
+**Impact:** Single engine serves multiple input sizes efficiently
+
+| Location | File |
+|----------|------|
+| Dynamic reshape | `samples/sampleDynamicReshape/sampleDynamicReshape.cpp` |
+| Variable seq length | `demo/BERT/builder_varseqlen.py` |
+
+### 7. Weight Stripping & Engine Refitting
+**Impact:** ~95% engine size reduction, enables OTA updates
+
+| Location | File |
+|----------|------|
+| Build stripped engine | `samples/python/sample_weight_stripping/build_engines.py` |
+| Refit and infer | `samples/python/sample_weight_stripping/refit_engine_and_infer.py` |
+
+### 8. Timing Cache
+**Impact:** 10x faster engine rebuilds, deterministic builds
+
+| Location | File |
+|----------|------|
+| Editable cache | `samples/sampleEditableTimingCache/sampleEditableTimingCache.cpp` |
+| Utilities | `shared/utils/cacheUtils.cpp` |
+| trtexec | Use `--timingCacheFile` flag |
+
+### 9. Efficient NMS Plugin
+**Impact:** 5-10x faster NMS for object detection
+
+| Location | File |
+|----------|------|
+| Plugin | `plugin/efficientNMSPlugin/efficientNMSPlugin.cpp` |
+| Kernels | `plugin/efficientNMSPlugin/efficientNMSInference.cu` |
+| Usage | `samples/python/efficientdet/build_engine.py` |
+
+### 10. Structured Sparsity (2:4)
+**Impact:** ~2x speedup on Ampere+ with minimal accuracy loss
+
+| Location | File |
+|----------|------|
+| BERT sparse builder | `demo/BERT/builder_varseqlen.py` (use `-sp` flag) |
+| Notebook | `demo/BERT/notebooks/BERT-TRT-INT8-QAT-sparse.ipynb` |
+
+## Code Location Quick Reference
+
+| Goal | Start Here |
+|------|------------|
+| Add INT8 support | `samples/sampleINT8API/` + `samples/common/EntropyCalibrator.h` |
+| Enable dynamic shapes | `samples/sampleDynamicReshape/sampleDynamicReshape.cpp` |
+| Create custom plugin | `samples/python/python_plugin/` or `plugin/` for C++ examples |
+| Debug accuracy issues | `tools/Polygraphy/` |
+| Modify ONNX graphs | `tools/onnx-graphsurgeon/examples/` |
+| Quantize PyTorch model | `tools/pytorch-quantization/` |
+| Run diffusion with FP8 | `demo/Diffusion/demo_txt2img_flux.py --fp8` |
+| Use timing cache | `samples/sampleEditableTimingCache/` |
+| Strip weights from engine | `samples/python/sample_weight_stripping/` |
+| Enable CUDA graphs | `demo/BERT/inference_c.py --enable-graph` |
+
+## Developer Tools
+
+- **Polygraphy** (`tools/Polygraphy/`): Debug accuracy, compare frameworks, precision debugging
+- **ONNX-GraphSurgeon** (`tools/onnx-graphsurgeon/`): Modify ONNX models programmatically
+- **TensorRT Engine Explorer** (`tools/experimental/trt-engine-explorer/`): Inspect engine plans and profiling data
+
 # References
 
 ## TensorRT Resources
